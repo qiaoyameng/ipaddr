@@ -723,3 +723,184 @@ class TC_Operator < Test::Unit::TestCase
     assert_equal('invalid address: INVALID', e.message)
   end
 end
+
+class TC_IPAddrSourceSelection < Test::Unit::TestCase
+  def select(dest, candidates, **opts)
+    IPAddr.select_source(dest, candidates, **opts)
+  end
+
+  def test_default_policy_table
+    table = IPAddr::DEFAULT_POLICY_TABLE
+    assert_equal(9, table.size)
+    assert_raise(FrozenError) { table << {} }
+    assert_equal({ prefix: "::1/128", precedence: 50, label: 0 }, table.first)
+    labels = table.map { |e| [e[:prefix], e[:label]] }
+    assert_include(labels, ["::ffff:0:0/96", 4])
+    assert_include(labels, ["fc00::/7", 13])
+  end
+
+  def test_scope_beats_longer_matching_prefix
+    # The nearer prefix loses to the candidate with appropriate scope
+    # because rule 2 is evaluated before rule 8.
+    result = select("2001:db8:1::1", [
+      { address: "2001:db8:1::5", prefix_length: 64, scope: IPAddr::SCOPE_LINK_LOCAL },
+      { address: "2001:db8:2::5", prefix_length: 64, scope: IPAddr::SCOPE_GLOBAL },
+    ])
+    assert_equal("2001:db8:2::5", result.winner.address.to_s)
+    elim = result.eliminations.find { |e| e.candidate.address.to_s == "2001:db8:1::5" }
+    assert_equal("2", elim.rule)
+    assert_equal("prefer appropriate scope", elim.rule_name)
+  end
+
+  def test_deprecated_fallback
+    deprecated = { address: "2001:db8::2", deprecated: true }
+    current = { address: "2001:db8::3" }
+
+    result = select("2001:db8::1", [deprecated, current])
+    assert_equal("2001:db8::3", result.winner.address.to_s)
+    assert_equal("3", result.eliminations.first.rule)
+
+    # With only deprecated candidates left, one is still selected.
+    result = select("2001:db8::1", [deprecated])
+    assert_equal(true, result.success?)
+    assert_equal("2001:db8::2", result.winner.address.to_s)
+    assert_empty(result.eliminations)
+  end
+
+  def test_complete_tie_keeps_first_candidate
+    result = select("2001:db8::1", [
+      { address: "2001:db8::5", interface: "eth0" },
+      { address: "2001:db8::5", interface: "eth1" },
+    ])
+    assert_equal("eth0", result.winner.interface)
+    elim = result.eliminations.first
+    assert_nil(elim.rule)
+    assert_nil(elim.rule_name)
+    assert_equal("eth1", elim.candidate.interface)
+  end
+
+  def test_same_address_on_different_interfaces_are_distinct_candidates
+    result = select("2001:db8::1", [
+      { address: "2001:db8::5", interface: "eth0" },
+      { address: "2001:db8::5", interface: "eth1" },
+    ], outgoing_interface: "eth1")
+    assert_equal("eth1", result.winner.interface)
+    assert_equal(1, result.unavailable.size)
+    assert_equal("eth0", result.unavailable.first.candidate.interface)
+  end
+
+  def test_destination_zone_restricts_candidates
+    result = select("fe80::1%eth0", [
+      { address: "fe80::2", interface: "eth1" },
+      { address: "fe80::3", interface: "eth0" },
+    ])
+    assert_equal("fe80::3", result.winner.address.to_s)
+    assert_equal(1, result.unavailable.size)
+    assert_equal("fe80::2", result.unavailable.first.candidate.address.to_s)
+  end
+
+  def test_no_available_candidate
+    result = select("fe80::1%eth0", [{ address: "fe80::2", interface: "eth1" }])
+    assert_equal(false, result.success?)
+    assert_nil(result.winner)
+    assert_equal(1, result.unavailable.size)
+  end
+
+  def test_family_mismatch_is_unavailable
+    result = select("192.0.2.1", [
+      { address: "2001:db8::1" },
+      { address: "192.0.2.9" },
+    ])
+    assert_equal("192.0.2.9", result.winner.address.to_s)
+    assert_equal(1, result.unavailable.size)
+  end
+
+  def test_same_address_rule
+    result = select("2001:db8::7", [
+      { address: "2001:db8::8" },
+      { address: "2001:db8::7" },
+    ])
+    assert_equal("2001:db8::7", result.winner.address.to_s)
+    assert_equal("1", result.eliminations.first.rule)
+  end
+
+  def test_caller_supplied_policy_table_labels
+    table = [
+      { prefix: "2001:db8:1::/48", precedence: 45, label: 7 },
+      { prefix: "::/0", precedence: 40, label: 1 },
+    ]
+    result = select("2001:db8:1::1", [
+      { address: "2001:db8:2::77" },
+      { address: "2001:db8:1::77" },
+    ], policy_table: table)
+    assert_equal("2001:db8:1::77", result.winner.address.to_s)
+    assert_equal("6", result.eliminations.first.rule)
+  end
+
+  def test_home_address_preferred
+    result = select("2001:db8::1", [
+      { address: "2001:db8::3" },
+      { address: "2001:db8::2", home: true },
+    ])
+    assert_equal("2001:db8::2", result.winner.address.to_s)
+    assert_equal("4", result.eliminations.first.rule)
+  end
+
+  def test_temporary_preferred_unless_reversed
+    public_addr = { address: "2001:db8::3" }
+    temporary = { address: "2001:db8::2", temporary: true }
+
+    result = select("2001:db8::1", [public_addr, temporary])
+    assert_equal("2001:db8::2", result.winner.address.to_s)
+    assert_equal("7", result.eliminations.first.rule)
+
+    result = select("2001:db8::1", [public_addr, temporary], prefer_temporary: false)
+    assert_equal("2001:db8::3", result.winner.address.to_s)
+  end
+
+  def test_next_hop_rule_and_unknown_route_information
+    advertised = { address: "2001:db8::2", next_hop: "router-a" }
+    other = { address: "2001:db8::3", next_hop: "router-b" }
+
+    result = select("2001:db8::1", [other, advertised], next_hop: "router-a")
+    assert_equal("2001:db8::2", result.winner.address.to_s)
+    assert_equal("5.5", result.eliminations.first.rule)
+
+    # Unknown route information is expressed by omitting next_hop;
+    # rule 5.5 is skipped and the candidates tie.
+    result = select("2001:db8::1", [other, advertised])
+    assert_equal("2001:db8::3", result.winner.address.to_s)
+    assert_nil(result.eliminations.first.rule)
+  end
+
+  def test_common_prefix_capped_at_candidate_prefix_length
+    # 2001:db8:ab00::1 shares 40 bits with the destination, but its
+    # prefix is only 16 bits long, so the common prefix length is
+    # capped at 16 and loses against 34 bits.
+    result = select("2001:db8:abcd::1", [
+      { address: "2001:db8:ab00::1", prefix_length: 16 },
+      { address: "2001:db8:8000::1", prefix_length: 64 },
+    ])
+    assert_equal("2001:db8:8000::1", result.winner.address.to_s)
+    assert_equal("8", result.eliminations.first.rule)
+  end
+
+  def test_ipv4_mapped_destination
+    result = select("::ffff:192.0.2.1", [
+      { address: "2001:db8::1" },
+      { address: "192.0.2.9" },
+    ])
+    assert_equal("192.0.2.9", result.winner.address.to_s)
+    assert_equal("6", result.eliminations.first.rule)
+  end
+
+  def test_source_candidate_objects_are_accepted
+    candidates = [
+      IPAddr::SourceCandidate.new(address: "2001:db8::2", interface: "eth0"),
+      IPAddr::SourceCandidate.new(address: IPAddr.new("2001:db8:abcd::3"), interface: "eth0"),
+    ]
+    result = select(IPAddr.new("2001:db8:abcd::1"), candidates)
+    assert_same(candidates[1], result.winner)
+    assert_same(candidates[0], result.eliminations.first.candidate)
+  end
+end

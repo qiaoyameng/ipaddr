@@ -46,6 +46,36 @@ ipaddr3 = IPAddr.new "192.168.2.0/24"
 p ipaddr3                   #=> #<IPAddr: IPv4:192.168.2.0/255.255.255.0>
 ```
 
+## RFC 6724 source address selection
+
+`IPAddr.select_source` simulates the RFC 6724 source address
+selection algorithm offline.  Everything the algorithm needs is
+passed explicitly (candidate attributes, outgoing interface, next
+hop, policy table); the state of the machine running the code is
+never consulted.
+
+```ruby
+require 'ipaddr'
+
+result = IPAddr.select_source("2001:db8::1", [
+  { address: "2001:db8::5", interface: "eth0", deprecated: true },
+  { address: "2001:db8::9", interface: "eth0" },
+])
+
+result.winner.address.to_s        #=> "2001:db8::9"
+result.eliminations.first.rule    #=> "3"
+result.eliminations.first.reason  #=> "the losing candidate is a deprecated address"
+```
+
+Candidates are compared pairwise with the RFC 6724 rules in their
+specified order (same address, appropriate scope, avoid deprecated,
+prefer home, outgoing interface, next-hop advertised prefix, matching
+label, temporary addresses, longest matching prefix); the first rule
+that distinguishes two candidates decides between them.  The policy
+table can be replaced with the `policy_table:` keyword (see
+`IPAddr::DEFAULT_POLICY_TABLE` for the shape), and unknown route
+information is expressed by simply omitting `next_hop:`.
+
 ## Alternative
 
 The [ipaddress](https://rubygems.org/gems/ipaddress) gem is a popular,

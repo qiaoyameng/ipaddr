@@ -587,6 +587,404 @@ class IPAddr
     end
   end
 
+  # == RFC 6724 Source Address Selection
+  #
+  # The following constants, classes and methods implement an offline
+  # simulation of the source address selection algorithm defined by
+  # RFC 6724 Section 5.  Every input the algorithm needs (candidate
+  # attributes, outgoing interface, next hop, policy table) is passed
+  # explicitly by the caller; the state of the machine running this
+  # code is never consulted.
+
+  # Interface-local scope (loopback addresses).
+  SCOPE_INTERFACE_LOCAL = 1
+  # Link-local scope.
+  SCOPE_LINK_LOCAL = 2
+  # Admin-local scope.
+  SCOPE_ADMIN_LOCAL = 4
+  # Site-local scope (deprecated by RFC 3879, kept for completeness).
+  SCOPE_SITE_LOCAL = 5
+  # Organization-local scope.
+  SCOPE_ORGANIZATION_LOCAL = 8
+  # Global scope.
+  SCOPE_GLOBAL = 14
+
+  # The default policy table defined by RFC 6724 Section 2.1.  Each
+  # entry is a Hash with :prefix, :precedence and :label keys.  A
+  # caller supplied table passed to IPAddr.select_source must use the
+  # same shape.
+  DEFAULT_POLICY_TABLE = [
+    { prefix: "::1/128",       precedence: 50, label: 0 },
+    { prefix: "::/0",          precedence: 40, label: 1 },
+    { prefix: "::ffff:0:0/96", precedence: 35, label: 4 },
+    { prefix: "2002::/16",     precedence: 30, label: 2 },
+    { prefix: "2001::/32",     precedence: 5,  label: 5 },
+    { prefix: "fc00::/7",      precedence: 3,  label: 13 },
+    { prefix: "::/96",         precedence: 1,  label: 3 },
+    { prefix: "fec0::/10",     precedence: 1,  label: 11 },
+    { prefix: "3ffe::/16",     precedence: 1,  label: 12 },
+  ].each(&:freeze).freeze
+
+  # Names of the RFC 6724 source address selection rules, keyed by the
+  # rule identifier used in SourceElimination#rule.
+  SOURCE_SELECTION_RULES = {
+    "1"   => "prefer same address",
+    "2"   => "prefer appropriate scope",
+    "3"   => "avoid deprecated addresses",
+    "4"   => "prefer home addresses",
+    "5"   => "prefer outgoing interface",
+    "5.5" => "prefer address in a prefix advertised by the next-hop",
+    "6"   => "prefer matching label",
+    "7"   => "prefer temporary addresses",
+    "8"   => "use longest matching prefix",
+  }.freeze
+
+  # A single source address candidate for IPAddr.select_source.  Two
+  # candidates are never considered equal just because they hold the
+  # same address: the same address assigned to different interfaces
+  # yields distinct candidates.
+  class SourceCandidate
+    # The candidate address (IPAddr).
+    attr_reader :address
+    # Name of the interface the address is assigned to, or nil.
+    attr_reader :interface
+    # Length in bits of the prefix the address belongs to.  The common
+    # prefix length used by rule 8 never exceeds this value.
+    attr_reader :prefix_length
+    # RFC 6724 scope of the address (see the SCOPE_* constants).
+    attr_reader :scope
+    # Next hop (router) that advertised the prefix of this address, or
+    # nil when the route information is unknown.  Used by rule 5.5.
+    attr_reader :next_hop
+
+    def initialize(address:, interface: nil, prefix_length: nil, scope: nil,
+                   deprecated: false, temporary: false, home: false, next_hop: nil)
+      @address = address.is_a?(IPAddr) ? address : IPAddr.new(address)
+      @interface = interface
+      @prefix_length = prefix_length || (@address.ipv4? ? 32 : 128)
+      @scope = scope || IPAddr.send(:rfc6724_scope, @address)
+      @deprecated = deprecated ? true : false
+      @temporary = temporary ? true : false
+      @home = home ? true : false
+      @next_hop = next_hop
+    end
+
+    # Whether the address is deprecated (RFC 4862).
+    def deprecated?
+      @deprecated
+    end
+
+    # Whether the address is a temporary address (RFC 4941).
+    def temporary?
+      @temporary
+    end
+
+    # Whether the address is a mobile home address (RFC 6275); an
+    # address that is not a home address acts as a care-of address.
+    def home?
+      @home
+    end
+
+    def to_s
+      str = @address.to_s
+      str << "%#{@interface}" if @interface
+      str
+    end
+
+    def inspect
+      flags = []
+      flags << "deprecated" if deprecated?
+      flags << "temporary" if temporary?
+      flags << "home" if home?
+      "#<IPAddr::SourceCandidate #{self} scope=#{@scope} prefix_length=#{@prefix_length}" \
+        "#{flags.empty? ? '' : ' ' + flags.join(' ')}>"
+    end
+  end
+
+  # Record describing why one candidate lost against another.  The
+  # candidate is always eliminated on the first rule that
+  # distinguishes it from the candidate it was compared with.
+  SourceElimination = Struct.new(:candidate, :rule, :rule_name, :reason, keyword_init: true)
+
+  # Record describing a candidate that did not take part in the rule
+  # comparison at all (wrong address family, different zone, or not on
+  # the outgoing interface).
+  UnavailableCandidate = Struct.new(:candidate, :reason, keyword_init: true)
+
+  # The outcome of IPAddr.select_source.
+  class SourceSelection
+    # The destination the selection ran for (IPAddr).
+    attr_reader :destination
+    # The selected SourceCandidate, or nil when no candidate was
+    # available.
+    attr_reader :winner
+    # Array of SourceElimination, one per candidate that lost a
+    # pairwise comparison, in the order the comparisons happened.
+    attr_reader :eliminations
+    # Array of UnavailableCandidate for candidates excluded before the
+    # rule comparison.
+    attr_reader :unavailable
+
+    def initialize(destination:, winner:, eliminations:, unavailable:)
+      @destination = destination
+      @winner = winner
+      @eliminations = eliminations.freeze
+      @unavailable = unavailable.freeze
+    end
+
+    # Whether a source address could be selected.
+    def success?
+      !@winner.nil?
+    end
+  end
+
+  # Selects the most appropriate source address candidate for reaching
+  # +destination+ following the RFC 6724 source address selection
+  # algorithm (Section 5).  This is a pure, offline simulation: every
+  # piece of information the algorithm needs is taken from the
+  # explicit arguments and the state of the running machine is never
+  # consulted.
+  #
+  # +destination+ may be an IPAddr or a String, optionally carrying an
+  # IPv6 zone (e.g. "fe80::1%eth0").  +candidates+ is a list of
+  # IPAddr::SourceCandidate objects or of Hashes accepted by
+  # IPAddr::SourceCandidate.new.
+  #
+  # Candidates whose address family does not match the destination
+  # (an IPv4 candidate still matches an IPv4-mapped IPv6 destination),
+  # that are not assigned to the destination zone, or that are not on
+  # the +outgoing_interface+ when one is given, are unavailable and do
+  # not take part in the rule comparison.  The remaining candidates
+  # are compared pairwise with the RFC 6724 rules in their specified
+  # order; the first rule that distinguishes two candidates decides
+  # between them, so the factors are never merged into a single score.
+  #
+  # +policy_table+ is the caller supplied label table (see
+  # IPAddr::DEFAULT_POLICY_TABLE for the shape).  +next_hop+ is the
+  # router that will be used to reach the destination; when it is nil
+  # (unknown route information) rule 5.5 is simply skipped.
+  # +prefer_temporary+ may be set to false to reverse rule 7.
+  #
+  # Returns an IPAddr::SourceSelection describing the winner, the
+  # unavailable candidates, and, for every eliminated candidate, the
+  # first rule on which it lost and why.
+  def self.select_source(destination, candidates, policy_table: DEFAULT_POLICY_TABLE,
+                         outgoing_interface: nil, next_hop: nil, prefer_temporary: true)
+    dest = destination.is_a?(IPAddr) ? destination : IPAddr.new(destination)
+    zone = dest.ipv6? && dest.zone_id ? dest.zone_id.sub(/\A%/, "") : nil
+    effective_interface = outgoing_interface || zone
+
+    table = compile_policy_table(policy_table)
+    dest_label = policy_label(table, dest)
+    dest_scope = rfc6724_scope(dest)
+
+    available = []
+    unavailable = []
+    candidates.each do |c|
+      candidate = c.is_a?(SourceCandidate) ? c : SourceCandidate.new(**c)
+      if !source_family_compatible?(candidate.address, dest)
+        unavailable << UnavailableCandidate.new(
+          candidate: candidate,
+          reason: "address family does not match the destination address family")
+      elsif zone && candidate.interface.to_s != zone
+        unavailable << UnavailableCandidate.new(
+          candidate: candidate,
+          reason: "not assigned to the destination zone interface #{zone}")
+      elsif outgoing_interface && candidate.interface != outgoing_interface
+        unavailable << UnavailableCandidate.new(
+          candidate: candidate,
+          reason: "not on the outgoing interface #{outgoing_interface}")
+      else
+        available << candidate
+      end
+    end
+
+    eliminations = []
+    winner = available.first
+    available.drop(1).each do |challenger|
+      rule, prefer_challenger, reason =
+        compare_source_candidates(winner, challenger, dest, dest_scope, dest_label, table,
+                                  effective_interface, next_hop, prefer_temporary)
+      loser = prefer_challenger ? winner : challenger
+      eliminations << SourceElimination.new(
+        candidate: loser,
+        rule: rule,
+        rule_name: rule && SOURCE_SELECTION_RULES[rule],
+        reason: reason)
+      winner = challenger if prefer_challenger
+    end
+
+    SourceSelection.new(destination: dest, winner: winner,
+                        eliminations: eliminations, unavailable: unavailable)
+  end
+
+  # :stopdoc:
+
+  def self.compile_policy_table(policy_table)
+    policy_table.map do |entry|
+      prefix = entry[:prefix]
+      prefix = IPAddr.new(prefix) unless prefix.is_a?(IPAddr)
+      [prefix, entry[:precedence], entry[:label]]
+    end
+  end
+  private_class_method :compile_policy_table
+
+  def self.policy_label(table, addr)
+    # IPv4 addresses are looked up both natively and in their
+    # IPv4-mapped form, so that entries such as ::ffff:0:0/96 apply.
+    addrs = addr.ipv4? ? [addr, addr.ipv4_mapped] : [addr]
+    best_length = -1
+    best_label = nil
+    table.each do |prefix, _precedence, label|
+      addrs.each do |a|
+        next unless prefix.family == a.family && prefix.include?(a)
+        if prefix.prefix > best_length
+          best_length = prefix.prefix
+          best_label = label
+        end
+      end
+    end
+    best_label
+  end
+  private_class_method :policy_label
+
+  def self.rfc6724_scope(addr)
+    if addr.ipv4?
+      i = addr.to_i
+      return SCOPE_INTERFACE_LOCAL if i & 0xff000000 == 0x7f000000
+      return SCOPE_LINK_LOCAL if i & 0xffff0000 == 0xa9fe0000
+      SCOPE_GLOBAL
+    else
+      i = addr.to_i
+      return SCOPE_INTERFACE_LOCAL if i == 1
+      return (i >> 112) & 0xf if (i >> 120) == 0xff # multicast
+      return SCOPE_LINK_LOCAL if (i >> 118) == 0x3fa # fe80::/10
+      return SCOPE_SITE_LOCAL if (i >> 118) == 0x3fb # fec0::/10
+      SCOPE_GLOBAL
+    end
+  end
+  private_class_method :rfc6724_scope
+
+  def self.source_family_compatible?(src, dest)
+    src.family == dest.family || (dest.ipv4_mapped? && src.ipv4?)
+  end
+  private_class_method :source_family_compatible?
+
+  def self.same_source_address?(candidate, dest)
+    src = candidate.address
+    return src.to_i == dest.to_i if src.family == dest.family
+    dest.ipv4_mapped? && src.ipv4? && src.ipv4_mapped.to_i == dest.to_i
+  end
+  private_class_method :same_source_address?
+
+  def self.common_prefix_length(candidate, dest)
+    src = candidate.address
+    if src.family == dest.family
+      bits = src.ipv4? ? 32 : 128
+      cap = candidate.prefix_length
+      xor = src.to_i ^ dest.to_i
+    elsif dest.ipv4_mapped? && src.ipv4?
+      bits = 128
+      cap = candidate.prefix_length + 96
+      xor = src.ipv4_mapped.to_i ^ dest.to_i
+    else
+      return 0
+    end
+    common = xor.zero? ? bits : bits - xor.bit_length
+    [common, cap].min
+  end
+  private_class_method :common_prefix_length
+
+  # Compares two candidates with the RFC 6724 rules in order and
+  # returns [rule_id, prefer_b, reason].  rule_id is nil when no rule
+  # could distinguish the candidates.
+  def self.compare_source_candidates(a, b, dest, dest_scope, dest_label, table,
+                                     interface, next_hop, prefer_temporary)
+    # Rule 1: Prefer same address.
+    a_same = same_source_address?(a, dest)
+    b_same = same_source_address?(b, dest)
+    if a_same != b_same
+      return ["1", b_same, "the other candidate is identical to the destination address"]
+    end
+
+    # Rule 2: Prefer appropriate scope.
+    if a.scope != b.scope
+      prefer_b =
+        if a.scope < dest_scope && b.scope < dest_scope
+          b.scope > a.scope
+        elsif a.scope < dest_scope
+          true
+        elsif b.scope < dest_scope
+          false
+        else
+          b.scope < a.scope
+        end
+      winner_scope, loser_scope = prefer_b ? [b.scope, a.scope] : [a.scope, b.scope]
+      return ["2", prefer_b,
+              "scope #{winner_scope} is more appropriate than scope #{loser_scope} " \
+              "for destination scope #{dest_scope}"]
+    end
+
+    # Rule 3: Avoid deprecated addresses.
+    if a.deprecated? != b.deprecated?
+      return ["3", !b.deprecated?, "the losing candidate is a deprecated address"]
+    end
+
+    # Rule 4: Prefer home addresses.
+    if a.home? != b.home?
+      return ["4", b.home?, "a home address is preferred over a care-of address"]
+    end
+
+    # Rule 5: Prefer outgoing interface.
+    if interface
+      a_on = a.interface == interface
+      b_on = b.interface == interface
+      if a_on != b_on
+        return ["5", b_on, "the losing candidate is not on the outgoing interface #{interface}"]
+      end
+    end
+
+    # Rule 5.5: Prefer addresses in a prefix advertised by the next-hop.
+    if next_hop
+      a_advertised = !a.next_hop.nil? && a.next_hop == next_hop
+      b_advertised = !b.next_hop.nil? && b.next_hop == next_hop
+      if a_advertised != b_advertised
+        return ["5.5", b_advertised,
+                "the losing candidate's prefix was not advertised by the selected next-hop #{next_hop}"]
+      end
+    end
+
+    # Rule 6: Prefer matching label.
+    a_match = policy_label(table, a.address) == dest_label
+    b_match = policy_label(table, b.address) == dest_label
+    if a_match != b_match
+      return ["6", b_match,
+              "the losing candidate's policy label does not match the destination label #{dest_label.inspect}"]
+    end
+
+    # Rule 7: Prefer temporary addresses.
+    if a.temporary? != b.temporary?
+      prefer_b = prefer_temporary ? b.temporary? : !b.temporary?
+      kind = prefer_temporary ? "temporary" : "public"
+      return ["7", prefer_b, "a #{kind} address is preferred"]
+    end
+
+    # Rule 8: Use longest matching prefix.
+    a_common = common_prefix_length(a, dest)
+    b_common = common_prefix_length(b, dest)
+    if a_common != b_common
+      prefer_b = b_common > a_common
+      winner_len, loser_len = prefer_b ? [b_common, a_common] : [a_common, b_common]
+      return ["8", prefer_b,
+              "common prefix with the destination is #{winner_len} bits versus #{loser_len} bits"]
+    end
+
+    [nil, false, "the candidates are indistinguishable under all RFC 6724 rules"]
+  end
+  private_class_method :compare_source_candidates
+
+  # :startdoc:
+
   protected
   # :stopdoc:
 
