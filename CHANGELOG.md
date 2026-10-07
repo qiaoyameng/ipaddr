@@ -1,3 +1,10 @@
+Unreleased
+----------
+
+- Add `IPAddr::CryptoPAn` (`require 'ipaddr/crypto_pan'`), a Crypto-PAn
+  prefix-preserving IP address anonymizer for IPv4 and IPv6 using a
+  32-byte key and AES via OpenSSL
+
 1.2.9
 -----
 

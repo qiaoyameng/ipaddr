@@ -46,6 +46,44 @@ ipaddr3 = IPAddr.new "192.168.2.0/24"
 p ipaddr3                   #=> #<IPAddr: IPv4:192.168.2.0/255.255.255.0>
 ```
 
+## Prefix-preserving anonymization (Crypto-PAn)
+
+`IPAddr::CryptoPAn` implements the Crypto-PAn algorithm (Xu, Fan,
+Ammar & Moon, ICNP 2002) for anonymizing IP addresses in logs while
+keeping the length of the prefix two addresses share.  It uses a
+32-byte key and AES (via the `openssl` library), supports both IPv4
+and IPv6, is deterministic for a given key, and is fully invertible
+with the same key.
+
+```ruby
+require 'ipaddr/crypto_pan'
+
+key = Random.bytes(32)  # 16-byte AES key + 16-byte pad seed; keep it secret
+cryptopan = IPAddr::CryptoPAn.new(key)
+
+anon = cryptopan.anonymize('192.0.2.1')
+cryptopan.deanonymize(anon)              #=> back to 192.0.2.1
+
+cryptopan.anonymize_cidr('192.0.2.128/25')  # keeps the /25 mask, zeroes host bits
+```
+
+Contract notes:
+
+- IPv4 and IPv6 are anonymized as independent namespaces; prefix
+  relationships are only preserved within one address family.
+  IPv4-mapped IPv6 addresses are treated as IPv6 (use `IPAddr#native`
+  first if you want IPv4 semantics).
+- Addresses with an IPv6 zone id (e.g. `fe80::1%eth0`) are rejected;
+  split the scope zone off before anonymizing.
+- The key never appears in `inspect`, error messages, or serialized
+  output (serialization is refused).
+
+**Warning:** prefix preservation is a property of the algorithm, not a
+privacy guarantee.  By construction it reveals which anonymized
+addresses share prefixes and for how long, so this must not be
+presented as unlinkable anonymization.  Anyone holding the key can
+reverse every mapping.
+
 ## Alternative
 
 The [ipaddress](https://rubygems.org/gems/ipaddress) gem is a popular,
