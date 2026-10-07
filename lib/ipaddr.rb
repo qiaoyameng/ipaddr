@@ -41,7 +41,7 @@ require 'socket'
 
 class IPAddr
   # The version string
-  VERSION = "1.2.9"
+  VERSION = "1.2.10"
 
   # 32 bit mask for IPv4
   IN4MASK = 0xffffffff
@@ -99,6 +99,10 @@ class IPAddr
 
   # Raised when the address is an invalid length.
   class InvalidPrefixError < InvalidAddressError; end
+
+  # The Crypto-PAn prefix-preserving address anonymizer is autoloaded;
+  # see IPAddr::CryptoPAn.
+  autoload :CryptoPAn, File.expand_path("ipaddr/crypto_pan", __dir__)
 
   # Returns the address family of this IP address.
   attr_reader :family

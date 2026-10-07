@@ -1,3 +1,10 @@
+1.2.10
+------
+
+- Add `IPAddr::CryptoPAn`, a prefix-preserving Crypto-PAn address
+  anonymizer (AES-128, 32-byte key) for IPv4 and IPv6 with reversible
+  single-address and CIDR entry points.
+
 1.2.9
 -----
 
