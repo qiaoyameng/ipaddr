@@ -587,6 +587,306 @@ class IPAddr
     end
   end
 
+  # In-memory RPKI origin validation support.  The classes in this
+  # module accept VRP data whose signatures have already been verified.
+  # They do not fetch certificates or validate certification paths.
+  module RPKI
+    # Route Origin Authorization tuple: prefix, maximum prefix length,
+    # and originating ASN.
+    class VRP < Struct.new(:prefix, :max_length, :asn)
+      MAX_ASN = 0xffffffff
+
+      def self.build(prefix, max_length = nil, asn = nil, maxLength: nil)
+        max_length = maxLength if max_length.nil?
+        new(prefix, max_length, asn)
+      end
+
+      def initialize(prefix, max_length, asn)
+        prefix = RPKI.coerce_prefix(prefix)
+        max_length = RPKI.validate_max_length(max_length, prefix)
+        asn = RPKI.validate_vrp_asn(asn)
+        super(prefix, max_length, asn)
+        freeze
+      end
+
+      def cidr
+        prefix.cidr
+      end
+    end
+
+    # A covering VRP and the reason it does not authorize a route.
+    class Rejection < Struct.new(:vrp, :reason)
+      def initialize(*)
+        super
+        freeze
+      end
+    end
+
+    # Result of an origin validation lookup.
+    # +authorizations+ determines a Valid result; +rejections+ determines
+    # an Invalid result and explains why each covering VRP rejects the
+    # route.
+    class Result < Struct.new(:status, :authorizations, :rejections)
+      def initialize(status, authorizations = [], rejections = [])
+        super(status, authorizations.freeze, rejections.freeze)
+        freeze
+      end
+
+      def valid?
+        status == VALID
+      end
+
+      def invalid?
+        status == INVALID
+      end
+
+      def not_found?
+        status == NOT_FOUND
+      end
+
+      def deciding_vrps
+        (authorizations + rejections.map(&:vrp)).freeze
+      end
+    end
+
+    # An immutable validation table with a monotonically increasing
+    # version number.
+    class Snapshot
+      attr_reader :version, :vrps
+
+      def initialize(version, vrps)
+        @version = version
+        @vrps = RPKI.normalize_vrps(vrps).freeze
+        @index = PrefixIndex.new(@vrps)
+        freeze
+      end
+
+      def lookup(prefix, origin_asn)
+        route = RPKI.coerce_prefix(prefix)
+        origin_asn = RPKI.validate_origin_asn(origin_asn)
+        @index.lookup(route, origin_asn)
+      end
+    end
+
+    # Atomic, in-memory RPKI origin validation view.
+    # Each successful replacement or incremental update publishes a new
+    # immutable snapshot and increments its version.
+    class OriginView
+      def initialize(vrps = [])
+        @mutex = Mutex.new
+        @snapshot = build_snapshot(0, vrps)
+      end
+
+      def version
+        @mutex.synchronize { @snapshot.version }
+      end
+
+      def snapshot
+        @mutex.synchronize { @snapshot }
+      end
+      alias current_snapshot snapshot
+
+      def lookup(prefix, origin_asn)
+        snapshot.lookup(prefix, origin_asn)
+      end
+
+      def replace(vrps)
+        @mutex.synchronize do
+          @snapshot = build_snapshot(@snapshot.version + 1, vrps)
+        end
+        version
+      end
+
+      def update(add: [], remove: [])
+        @mutex.synchronize do
+          additions = RPKI.normalize_vrps(add)
+          removals = RPKI.normalize_vrps(remove)
+          overlap = additions & removals
+          unless overlap.empty?
+            raise InvalidVRPError, "cannot add and remove the same VRP: #{overlap.first.cidr}"
+          end
+
+          next_vrps = (@snapshot.vrps + additions - removals).uniq
+          @snapshot = Snapshot.new(@snapshot.version + 1, next_vrps)
+          @snapshot.version
+        end
+      end
+
+      private
+
+      def build_snapshot(version, vrps)
+        Snapshot.new(version, vrps)
+      end
+    end
+
+    class InvalidVRPError < Error; end
+    class InvalidQueryError < Error; end
+
+    VALID = "Valid".freeze
+    INVALID = "Invalid".freeze
+    NOT_FOUND = "NotFound".freeze
+
+    class << self
+      def coerce_prefix(prefix)
+        address =
+          case prefix
+          when IPAddr
+            prefix.clone
+          else
+            IPAddr.new(prefix)
+          end
+        if address.ipv6? && !address.zone_id.nil?
+          raise InvalidAddressError, "scoped IPv6 addresses are not supported: #{address}"
+        end
+        address.mask(address.prefix)
+      end
+
+      def validate_max_length(max_length, prefix)
+        unless max_length.is_a?(Integer)
+          raise InvalidVRPError, "maxLength must be an integer: #{max_length.inspect}"
+        end
+
+        maximum = prefix.ipv4? ? 32 : 128
+        if max_length < prefix.prefix || max_length > maximum
+          raise InvalidVRPError,
+                "maxLength must be between #{prefix.prefix} and #{maximum}: #{max_length}"
+        end
+        max_length
+      end
+
+      def validate_vrp_asn(asn)
+        unless asn.is_a?(Integer)
+          raise InvalidVRPError, "ASN must be an integer: #{asn.inspect}"
+        end
+        if asn < 0 || asn > VRP::MAX_ASN
+          raise InvalidVRPError, "ASN must be between 0 and #{VRP::MAX_ASN}: #{asn}"
+        end
+        asn
+      end
+
+      def validate_origin_asn(asn)
+        unless asn.is_a?(Integer)
+          raise InvalidQueryError, "origin ASN must be an integer: #{asn.inspect}"
+        end
+        if asn < 0 || asn > VRP::MAX_ASN
+          raise InvalidQueryError,
+                "origin ASN must be between 0 and #{VRP::MAX_ASN}: #{asn}"
+        end
+        asn
+      end
+
+      def normalize_vrps(vrps)
+        unless vrps.is_a?(Enumerable)
+          raise InvalidVRPError, "VRPs must be an Enumerable"
+        end
+        vrps.map { |vrp| normalize_vrp(vrp) }.uniq
+      end
+
+      def normalize_vrp(vrp)
+        case vrp
+        when VRP
+          vrp
+        when Array
+          unless vrp.length == 3
+            raise InvalidVRPError, "VRP tuple must contain prefix, maxLength and ASN"
+          end
+          VRP.new(*vrp)
+        when Hash
+          VRP.build(vrp[:prefix], vrp[:max_length] || vrp[:maxLength], vrp[:asn])
+        else
+          raise InvalidVRPError, "invalid VRP: #{vrp.inspect}"
+        end
+      end
+    end
+
+    class PrefixTrie
+      Node = Struct.new(:children, :entries)
+
+      def initialize(family)
+        @max_prefix_length = family == Socket::AF_INET ? 32 : 128
+        @root = Node.new({}, [])
+      end
+
+      def add(vrp)
+        node = @root
+        address = vrp.prefix.to_i
+        vrp.prefix.prefix.times do |index|
+          bit = (address >> (@max_prefix_length - index - 1)) & 1
+          node = node.children[bit] ||= Node.new({}, [])
+        end
+        node.entries << vrp
+      end
+
+      def each_covering(address, prefix_length)
+        return enum_for(:each_covering, address, prefix_length) unless block_given?
+
+        node = @root
+        node.entries.each { |vrp| yield(vrp) }
+        prefix_length.times do |index|
+          bit = (address >> (@max_prefix_length - index - 1)) & 1
+          node = node.children[bit]
+          break if node.nil?
+          node.entries.each { |vrp| yield(vrp) }
+        end
+      end
+
+      def build
+        freeze_node(@root)
+      end
+
+      private
+
+      def freeze_node(node)
+        node.entries.sort_by! { |vrp| [vrp.max_length, vrp.asn] }
+        node.entries.freeze
+        node.children.each_value { |child| freeze_node(child) }
+        node.children.freeze
+        node.freeze
+      end
+    end
+
+    class PrefixIndex
+      def initialize(vrps)
+        @tries = {
+          Socket::AF_INET => PrefixTrie.new(Socket::AF_INET),
+          Socket::AF_INET6 => PrefixTrie.new(Socket::AF_INET6)
+        }
+        vrps.each { |vrp| @tries.fetch(vrp.prefix.family).add(vrp) }
+        @tries.each_value(&:build)
+      end
+
+      def lookup(route, origin_asn)
+        authorizations = []
+        rejections = []
+        route_length = route.prefix
+
+        @tries.fetch(route.family).each_covering(route.to_i, route_length) do |vrp|
+          next unless vrp.max_length >= route_length
+
+          if vrp.asn.zero?
+            rejections << Rejection.new(vrp, :as0_vrp)
+          elsif origin_asn.zero?
+            rejections << Rejection.new(vrp, :as0_origin)
+          elsif vrp.asn == origin_asn
+            authorizations << vrp
+          else
+            rejections << Rejection.new(vrp, :asn_mismatch)
+          end
+        end
+
+        if authorizations.any?
+          Result.new(VALID, authorizations.uniq, [])
+        elsif rejections.any?
+          Result.new(INVALID, [], rejections.uniq)
+        else
+          Result.new(NOT_FOUND)
+        end
+      end
+    end
+
+    private_constant :PrefixTrie, :PrefixIndex
+  end
+
   protected
   # :stopdoc:
 

@@ -46,6 +46,37 @@ ipaddr3 = IPAddr.new "192.168.2.0/24"
 p ipaddr3                   #=> #<IPAddr: IPv4:192.168.2.0/255.255.255.0>
 ```
 
+### RPKI origin validation
+
+`IPAddr::RPKI::OriginView` provides an in-memory RFC 6811 origin
+validation view for already signed VRP data. It does not download
+certificates or validate certificate chains.
+
+```ruby
+view = IPAddr::RPKI::OriginView.new([
+  ["192.0.2.0/24", 24, 64496],
+  ["198.51.100.0/24", 24, 0]
+])
+
+result = view.lookup("192.0.2.0/24", 64496)
+result.status           #=> "Valid"
+result.authorizations   #=> VRPs that decide the Valid result
+
+result = view.lookup("192.0.2.0/24", 64497)
+result.status           #=> "Invalid"
+result.rejections.map(&:reason)
+
+snapshot = view.snapshot
+view.replace([["203.0.113.0/24", 24, 64498]])
+snapshot.version        #=> remains stable for the held snapshot
+```
+
+VRPs may also be supplied as `IPAddr::RPKI::VRP` objects or hashes with
+`prefix`, `maxLength`, and `asn` keys. `replace` and `update` validate
+the complete batch before publishing a new immutable snapshot. IPv4 and
+IPv6 indexes are separate, AS 0 is handled as a rejecting authorization,
+and invalid `maxLength` values raise `IPAddr::RPKI::InvalidVRPError`.
+
 ## Alternative
 
 The [ipaddress](https://rubygems.org/gems/ipaddress) gem is a popular,
