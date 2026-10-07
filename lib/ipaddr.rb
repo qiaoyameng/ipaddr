@@ -562,6 +562,428 @@ class IPAddr
     _to_string(mask)
   end
 
+  # In-memory RPKI route origin validation (RFC 6811). This namespace
+  # accepts VRP payloads that have already had their signatures verified;
+  # it does not download certificates or verify a certificate chain.
+  module RPKI
+    # The route is covered and at least one VRP authorizes it.
+    VALID = :valid
+    # The route is covered, but every covering VRP rejects it.
+    INVALID = :invalid
+    # No VRP covers the route.
+    NOT_FOUND = :not_found
+
+    # Raised for invalid RPKI input or query values.
+    class ValidationError < Error; end
+    # Raised when a VRP tuple has invalid prefix, maxLength, or ASN values.
+    class InvalidVRPError < ValidationError; end
+
+    # A validated route origin authorization: prefix, maxLength, and ASN.
+    VRP = Struct.new(:prefix, :max_length, :asn)
+    # A covering VRP and the reason it rejects a particular route.
+    Rejection = Struct.new(:vrp, :reason, :message)
+
+    # Outcome of validating one route prefix against one origin ASN.
+    class Result
+      attr_reader :status, :route_prefix, :origin_asn, :authorizations
+
+      def initialize(status, route_prefix, origin_asn, authorizations, covering_nodes)
+        @status = status
+        @route_prefix = route_prefix
+        @origin_asn = origin_asn
+        @authorizations = authorizations
+        @covering_nodes = covering_nodes
+      end
+
+      def valid?
+        status == VALID
+      end
+
+      def invalid?
+        status == INVALID
+      end
+
+      def not_found?
+        status == NOT_FOUND
+      end
+
+      def code
+        case status
+        when VALID
+          "Valid"
+        when INVALID
+          "Invalid"
+        else
+          "NotFound"
+        end
+      end
+
+      alias to_s code
+
+      def rejections
+        @rejections ||= build_rejections.freeze
+      end
+
+      private
+
+      def prefix_at(depth)
+        address_length = route_prefix.ipv4? ? 32 : 128
+        host_bits = address_length - depth
+        mask = ((2**address_length - 1) >> host_bits) << host_bits
+        IPAddr.new(route_prefix.to_i & mask, route_prefix.family).mask(depth).freeze
+      end
+
+      def build_rejections
+        return [] if status == VALID
+
+        @covering_nodes.flat_map { |depth, node|
+          node.groups.flat_map { |asn, max_lengths|
+            max_lengths.map { |max_length|
+              next if asn == origin_asn && asn != 0 && max_length >= route_prefix.prefix
+
+              if asn == 0
+                reason = :as0
+                message = "AS0 VRPs withdraw authorization and do not authorize a route origin"
+              elsif asn == origin_asn
+                reason = :prefix_length_exceeds_max_length
+                message = "route prefix length #{route_prefix.prefix} exceeds maxLength #{max_length}"
+              else
+                reason = :origin_asn_mismatch
+                message = "expected origin ASN #{asn}, got #{origin_asn}"
+              end
+
+              vrp = VRP.new(prefix_at(depth), max_length, asn).freeze
+              Rejection.new(vrp, reason, message).freeze
+            }
+          }
+        }.compact.sort_by { |rejection|
+          [-rejection.vrp.prefix.prefix, rejection.vrp.asn, rejection.vrp.max_length]
+        }
+      end
+    end
+
+    # An immutable, published set of VRP indexes.
+    class Version
+      attr_reader :number, :ipv4_root, :ipv6_root, :authorization_count
+
+      def self.empty(number = 0)
+        new(number, Node.new.freeze, Node.new.freeze, 0).freeze
+      end
+
+      def self.build(number, vrps)
+        unless vrps.respond_to?(:each)
+          raise InvalidVRPError, "VRPs must be an enumerable collection"
+        end
+
+        ipv4_root = Node.new
+        ipv6_root = Node.new
+        validated_vrps = vrps.map { |raw_vrp| InputParser.vrp(raw_vrp) }
+        authorization_count = 0
+
+        validated_vrps.each { |vrp|
+          root = vrp.prefix.ipv4? ? ipv4_root : ipv6_root
+          authorization_count += 1 if root.add(
+            vrp.prefix.to_i, vrp.prefix.prefix, vrp.max_length, vrp.asn,
+            vrp.prefix.ipv4? ? 32 : 128
+          )
+        }
+
+        new(number, ipv4_root.freeze, ipv6_root.freeze, authorization_count).freeze
+      end
+
+      def initialize(number, ipv4_root, ipv6_root, authorization_count)
+        @number = number
+        @ipv4_root = ipv4_root
+        @ipv6_root = ipv6_root
+        @authorization_count = authorization_count
+      end
+
+      def validate(route_prefix, origin_asn)
+        root = route_prefix.ipv4? ? ipv4_root : ipv6_root
+        route_length = route_prefix.prefix
+        address = route_prefix.to_i
+        address_length = route_prefix.ipv4? ? 32 : 128
+        node = root
+        covering_nodes = []
+
+        0.upto(route_length) { |depth|
+          covering_nodes << [depth, node] if node.groups
+
+          break if depth == route_length
+
+          bit = (address >> (address_length - depth - 1)) & 1
+          child = node.children[bit]
+          break unless child
+          node = child
+        }
+
+        return Result.new(NOT_FOUND, route_prefix, origin_asn, [].freeze, [].freeze) if
+          covering_nodes.empty?
+
+        authorizations = covering_nodes.flat_map { |depth, covering_node|
+          max_lengths = covering_node.groups[origin_asn]
+          next [] if max_lengths.nil? || origin_asn.zero?
+
+          max_lengths.select { |max_length|
+            max_length >= route_length
+          }.map { |max_length|
+            VRP.new(prefix_at(route_prefix, depth), max_length, origin_asn).freeze
+          }
+        }.sort_by { |vrp|
+          [-vrp.prefix.prefix, vrp.max_length]
+        }
+
+        status = authorizations.empty? ? INVALID : VALID
+        Result.new(status, route_prefix, origin_asn,
+                   authorizations.freeze, covering_nodes.freeze)
+      end
+
+      private
+
+      def prefix_at(route_prefix, depth)
+        address_length = route_prefix.ipv4? ? 32 : 128
+        host_bits = address_length - depth
+        mask = ((2**address_length - 1) >> host_bits) << host_bits
+        IPAddr.new(route_prefix.to_i & mask, route_prefix.family).mask(depth).freeze
+      end
+    end
+
+    # A query handle pinned to one immutable version.
+    class Snapshot
+      attr_reader :version
+
+      def initialize(version)
+        @version = version
+      end
+
+      def version_number
+        @version.number
+      end
+
+      def validate(prefix, origin_asn)
+        route_prefix, = InputParser.route(prefix)
+        @version.validate(route_prefix, InputParser.asn(origin_asn))
+      end
+    end
+
+    # An atomic in-memory VRP view.
+    class View
+      attr_reader :version
+
+      def initialize(vrps = [])
+        @mutex = Mutex.new
+        @version = Version.empty
+        replace(vrps)
+      end
+
+      def version_number
+        @version.number
+      end
+
+      def authorization_count
+        @version.authorization_count
+      end
+
+      # Parse and index every VRP before replacing the current version.
+      def replace(vrps)
+        @mutex.synchronize {
+          @version = Version.build(@version.number + 1, vrps)
+        }
+        self
+      end
+
+      # Returns a snapshot that continues to see this version after updates.
+      def snapshot
+        Snapshot.new(@version)
+      end
+
+      def with_snapshot
+        yield snapshot
+      end
+
+      def validate(prefix, origin_asn)
+        route_prefix, = InputParser.route(prefix)
+        @version.validate(route_prefix, InputParser.asn(origin_asn))
+      end
+    end
+
+    # Binary prefix trie: a query follows at most 32 or 128 nodes.
+    class Node
+      attr_reader :children, :groups
+
+      def initialize
+        @children = [nil, nil]
+        @groups = nil
+      end
+
+      def add(address, prefix_length, max_length, asn, address_length)
+        node = self
+        prefix_length.times { |depth|
+          bit = (address >> (address_length - depth - 1)) & 1
+          node.children[bit] ||= Node.new
+          node = node.children[bit]
+        }
+
+        node.add_group(asn, max_length)
+      end
+
+      def add_group(asn, max_length)
+        @groups ||= {}
+        @groups[asn] ||= []
+        unless @groups[asn].include?(max_length)
+          @groups[asn] << max_length
+          true
+        else
+          false
+        end
+      end
+
+      def freeze
+        children.each { |child| child.freeze if child }
+        children.freeze
+        if groups
+          groups.each_pair { |asn, max_lengths|
+            groups[asn] = max_lengths.sort.freeze
+          }
+          groups.freeze
+        end
+        super
+      end
+    end
+
+    module InputParser
+      module_function
+
+      def vrp(input)
+        prefix, max_length, asn = components(input)
+        begin
+          network, prefix_length = strict_prefix(prefix, "VRP prefix")
+        rescue Error => error
+          raise InvalidVRPError, error.message
+        end
+        max_length = integer(max_length, "maxLength")
+        asn = asn(asn)
+        maximum_length = network.ipv4? ? 32 : 128
+
+        if max_length < prefix_length || max_length > maximum_length
+          raise InvalidVRPError,
+                "maxLength #{max_length} is outside #{prefix_length}..#{maximum_length}"
+        end
+
+        VRP.new(network, max_length, asn).freeze
+      end
+
+      def route(prefix)
+        begin
+          strict_prefix(prefix, "route prefix")
+        rescue Error => error
+          raise ValidationError, error.message
+        end
+      end
+
+      def asn(value)
+        unless value.is_a?(Integer) && (0..4_294_967_295).cover?(value)
+          raise InvalidVRPError, "ASN must be an integer in 0..4294967295"
+        end
+
+        value
+      end
+
+      def components(input)
+        case input
+        when VRP
+          [input.prefix, input.max_length, input.asn]
+        when Array
+          unless input.length == 3
+            raise InvalidVRPError, "VRP array must contain prefix, maxLength, and ASN"
+          end
+
+          input
+        when Hash
+          [
+            field(input, :prefix),
+            field(input, :max_length, :maxLength),
+            field(input, :asn, :ASN)
+          ]
+        else
+          if input.respond_to?(:prefix) &&
+             input.respond_to?(:max_length) &&
+             input.respond_to?(:asn)
+            [input.prefix, input.max_length, input.asn]
+          else
+            raise InvalidVRPError, "unsupported VRP: #{input.inspect}"
+          end
+        end
+      end
+
+      def field(hash, *keys)
+        keys.each do |key|
+          return hash[key] if hash.key?(key)
+
+          string_key = key.to_s
+          return hash[string_key] if hash.key?(string_key)
+        end
+        nil
+      end
+
+      def integer(value, name)
+        unless value.is_a?(Integer)
+          raise InvalidVRPError, "#{name} must be an integer"
+        end
+
+        value
+      end
+
+      def strict_prefix(value, label)
+        case value
+        when IPAddr
+          network = value.clone
+          masked = network.mask(network.prefix)
+          unless masked.to_i == value.to_i
+            raise InvalidPrefixError, "#{label} has host bits set: #{value.cidr}"
+          end
+          network = masked
+        when String
+          if value.include?("%")
+            raise InvalidAddressError, "#{label} must not contain a zone identifier"
+          end
+
+          address, raw_length = value.split("/", 2)
+          candidate = IPAddr.new(address)
+          maximum_length = candidate.ipv4? ? 32 : 128
+          length = raw_length ? parse_length(raw_length, maximum_length) : maximum_length
+          network = candidate.mask(length)
+          unless candidate.to_i == network.to_i
+            raise InvalidPrefixError, "#{label} has host bits set: #{value}"
+          end
+        else
+          raise InvalidPrefixError, "#{label} must be an IPAddr or prefix string"
+        end
+
+        if network.ipv6? && network.zone_id
+          raise InvalidAddressError, "#{label} must not contain a zone identifier"
+        end
+
+        [network.freeze, network.prefix]
+      end
+
+      def parse_length(value, maximum)
+        unless /\A(?:0|[1-9]\d*)\z/.match?(value)
+          raise InvalidPrefixError, "invalid prefix length: #{value.inspect}"
+        end
+
+        length = value.to_i
+        unless length >= 0 && length <= maximum
+          raise InvalidPrefixError, "prefix length #{length} is outside 0..#{maximum}"
+        end
+
+        length
+      end
+    end
+
+    private_constant :InputParser, :Node, :Version
+  end
+
   # Returns the IPv6 zone identifier, if present.
   # Raises InvalidAddressError if not an IPv6 address.
   def zone_id

@@ -723,3 +723,325 @@ class TC_Operator < Test::Unit::TestCase
     assert_equal('invalid address: INVALID', e.message)
   end
 end
+
+class TC_RPKIOriginValidation < Test::Unit::TestCase
+  def test_valid_invalid_and_not_found
+    view = IPAddr::RPKI::View.new([
+      { prefix: "10.0.0.0/24", maxLength: 26, asn: 65000 },
+      { prefix: "2001:db8::/32", maxLength: 48, asn: 65001 }
+    ])
+
+    valid = view.validate("10.0.0.0/25", 65000)
+    assert_predicate(valid, :valid?)
+    assert_equal(:valid, valid.status)
+    assert_equal("Valid", valid.code)
+    assert_equal("Valid", valid.to_s)
+    assert_equal([["10.0.0.0/24", 26, 65000]], vrp_tuples(valid.authorizations))
+    assert_empty(valid.rejections)
+
+    invalid = view.validate("10.0.0.0/27", 65000)
+    assert_predicate(invalid, :invalid?)
+    assert_equal(:invalid, invalid.status)
+    assert_equal("Invalid", invalid.code)
+    assert_empty(invalid.authorizations)
+    assert_equal([
+      ["10.0.0.0/24", 26, 65000], :prefix_length_exceeds_max_length
+    ], rejection_tuple(invalid.rejections.first))
+
+    wrong_asn = view.validate("10.0.0.0/24", 65002)
+    assert_predicate(wrong_asn, :invalid?)
+    assert_equal(:origin_asn_mismatch, wrong_asn.rejections.first.reason)
+    assert_match(/expected origin ASN 65000/, wrong_asn.rejections.first.message)
+
+    not_found = view.validate("192.0.2.0/24", 65000)
+    assert_predicate(not_found, :not_found?)
+    assert_equal(:not_found, not_found.status)
+    assert_equal("NotFound", not_found.code)
+    assert_empty(not_found.authorizations)
+    assert_empty(not_found.rejections)
+  end
+
+  def test_as0_always_rejects_origin_asns
+    view = IPAddr::RPKI::View.new([
+      ["10.0.0.0/24", 24, 0]
+    ])
+
+    result = view.validate("10.0.0.0/24", 65000)
+    assert_predicate(result, :invalid?)
+    assert_equal(:as0, result.rejections.first.reason)
+    assert_equal(0, result.rejections.first.vrp.asn)
+  end
+
+  def test_allowing_vrp_wins_when_denying_vrp_also_covers
+    view = IPAddr::RPKI::View.new([
+      ["10.0.0.0/24", 24, 0],
+      ["10.0.0.0/24", 24, 65000],
+      ["10.0.0.0/23", 25, 65001]
+    ])
+
+    same_prefix = view.validate("10.0.0.0/24", 65000)
+    assert_predicate(same_prefix, :valid?)
+    assert_equal([["10.0.0.0/24", 24, 65000]],
+                 vrp_tuples(same_prefix.authorizations))
+
+    shorter_allow = view.validate("10.0.0.0/25", 65001)
+    assert_predicate(shorter_allow, :valid?)
+    assert_equal([["10.0.0.0/23", 25, 65001]],
+                 vrp_tuples(shorter_allow.authorizations))
+
+    invalid = view.validate("10.0.0.0/24", 65002)
+    assert_predicate(invalid, :invalid?)
+    reasons = invalid.rejections.map(&:reason).sort
+    assert_equal([:as0, :origin_asn_mismatch, :origin_asn_mismatch], reasons)
+  end
+
+  def test_multiple_authorizations_and_dedupes_more_specific_max_length
+    view = IPAddr::RPKI::View.new([
+      ["10.0.0.0/22", 26, 65000],
+      ["10.0.0.0/24", 25, 65000],
+      ["10.0.0.0/24", 24, 65000]
+    ])
+
+    result = view.validate("10.0.0.0/25", 65000)
+    assert_predicate(result, :valid?)
+    assert_equal([
+      ["10.0.0.0/24", 25, 65000],
+      ["10.0.0.0/22", 26, 65000]
+    ], vrp_tuples(result.authorizations))
+    assert_equal(3, view.authorization_count)
+  end
+
+  def test_accepts_ipaddr_struct_and_string_keyed_hashes
+    prefix = IPAddr.new("10.0.0.0/24")
+    vrp = IPAddr::RPKI::VRP.new(prefix, 25, 65000)
+    view = IPAddr::RPKI::View.new([
+      vrp,
+      { "prefix" => "192.0.2.0/24", "maxLength" => 24, "ASN" => 65001 }
+    ])
+
+    assert_predicate(view.validate(IPAddr.new("10.0.0.0/25"), 65000), :valid?)
+    assert_predicate(view.validate("192.0.2.0/24", 65001), :valid?)
+  end
+
+  def test_ipv4_and_ipv6_are_separate
+    view = IPAddr::RPKI::View.new([
+      ["203.0.113.0/24", 24, 65000],
+      ["2001:db8::/32", 32, 65000]
+    ])
+
+    assert_predicate(view.validate("203.0.113.0/24", 65000), :valid?)
+    assert_predicate(view.validate("203.0.113.0/24", 65001), :invalid?)
+    assert_predicate(view.validate("2001:db8::/32", 65000), :valid?)
+    assert_predicate(view.validate("2001:db8::/48", 65000), :invalid?)
+  end
+
+  def test_snapshot_keeps_a_stable_version
+    view = IPAddr::RPKI::View.new([["10.0.0.0/24", 24, 65000]])
+    snapshot = view.snapshot
+
+    assert_equal(1, view.version_number)
+    assert_equal(1, snapshot.version_number)
+    view.replace([["192.0.2.0/24", 24, 65001]])
+    assert_equal(2, view.version_number)
+    assert_equal(1, snapshot.version_number)
+    assert_predicate(snapshot.validate("10.0.0.0/24", 65000), :valid?)
+    assert_predicate(snapshot.validate("192.0.2.0/24", 65001), :not_found?)
+    assert_predicate(view.validate("10.0.0.0/24", 65000), :not_found?)
+    assert_predicate(view.validate("192.0.2.0/24", 65001), :valid?)
+  end
+
+  def test_failed_batch_validation_does_not_publish
+    view = IPAddr::RPKI::View.new([["10.0.0.0/24", 24, 65000]])
+    old_version = view.version
+
+    assert_raise(IPAddr::RPKI::InvalidVRPError) do
+      view.replace([
+        ["192.0.2.0/24", 24, 65001],
+        ["192.0.2.0/24", 23, 65001]
+      ])
+    end
+    assert_same(old_version, view.version)
+    assert_equal(1, view.version_number)
+    assert_equal(1, view.authorization_count)
+    assert_predicate(view.validate("10.0.0.0/24", 65000), :valid?)
+    assert_predicate(view.validate("192.0.2.0/24", 65001), :not_found?)
+  end
+
+  def test_invalid_vrps
+    view = IPAddr::RPKI::View.new
+
+    [
+      [["10.0.0.0/24", 23, 65000], /maxLength 23 is outside 24/],
+      [["10.0.0.0/24", 33, 65000], /maxLength 33 is outside/],
+      [["2001:db8::/32", 129, 65000], /maxLength 129 is outside/],
+      [["10.0.0.1/24", 24, 65000], /host bits/],
+      [["10.0.0.0/24", 24, -1], /ASN must be an integer/],
+      [["10.0.0.0/24", 24, 4294967296], /ASN must be an integer/],
+      [["10.0.0.0/24", "24", 65000], /maxLength must be an integer/]
+    ].each do |vrp, message|
+      e = assert_raise(IPAddr::RPKI::InvalidVRPError) do
+        view.replace([vrp])
+      end
+      assert_match(message, e.message)
+      assert_equal(0, view.authorization_count)
+    end
+
+  end
+
+  def test_small_ipv4_domain_matches_naive_reference
+    assert_matches_naive_reference("10.0.0.0", 32, 1)
+  end
+
+  def test_small_ipv6_domain_matches_naive_reference
+    assert_matches_naive_reference("2001:db8::", 128, 1)
+  end
+
+  private
+
+  def vrp_tuples(vrps)
+    vrps.map { |vrp| [vrp.prefix.cidr, vrp.max_length, vrp.asn] }
+  end
+
+  def rejection_tuple(rejection)
+    [
+      [rejection.vrp.prefix.cidr, rejection.vrp.max_length, rejection.vrp.asn],
+      rejection.reason
+    ]
+  end
+
+  def assert_matches_naive_reference(base, total_length, domain_bits)
+    candidates = exhaustive_vrps(base, total_length, domain_bits)
+    mismatches = []
+
+    0.upto((1 << candidates.size) - 1) do |mask|
+      vrps = candidates.each_with_index.select { |_, index|
+        mask[index] == 1
+      }.map(&:first)
+
+      view = IPAddr::RPKI::View.new(vrps)
+
+      0.upto(domain_bits) do |route_length|
+        0.upto((1 << route_length) - 1) do |subnet|
+          address = (subnet << (domain_bits - route_length))
+          prefix_length = total_length - domain_bits + route_length
+          route = route_cidr(base, address, prefix_length)
+
+          [0, 65000, 65001, 65002].each do |asn|
+            expected = naive_validation(vrps, route, asn)
+            actual = view.validate(route, asn)
+            actual_authorizations = vrp_tuples(actual.authorizations).sort
+            expected_authorizations = expected[:authorizations].sort
+            actual_rejections =
+              if actual.invalid?
+                actual.rejections.map { |rejection|
+                  rejection_tuple(rejection).flatten
+                }.sort
+              else
+                []
+              end
+            expected_rejections =
+              if expected[:status] == :invalid
+                expected[:rejections].sort
+              else
+                []
+              end
+            observed = {
+              status: actual.status,
+              code: actual.code,
+              authorizations: actual_authorizations,
+              rejections: actual_rejections
+            }
+            expected_observation = {
+              status: expected[:status],
+              code: rfc_code(expected[:status]),
+              authorizations: expected_authorizations,
+              rejections: expected_rejections
+            }
+            mismatches << [vrps, route, asn, expected_observation, observed] if
+              observed != expected_observation
+          end
+        end
+      end
+    end
+
+    assert_empty(mismatches, mismatches.first(3).inspect)
+  end
+
+  def exhaustive_vrps(base, total_length, domain_bits)
+    0.upto(domain_bits).flat_map { |prefix_length|
+      0.upto((1 << prefix_length) - 1).flat_map { |subnet|
+        address = subnet << (domain_bits - prefix_length)
+        (prefix_length..domain_bits).flat_map { |max_length|
+          [0, 65000, 65001].map { |asn|
+            [route_cidr(base, address, total_length - domain_bits + prefix_length),
+             total_length - domain_bits + max_length, asn]
+          }
+        }
+      }
+    }
+  end
+
+  def route_cidr(base, host, prefix_length)
+    network = IPAddr.new(base)
+    IPAddr.new(network.to_i | host, network.family).mask(prefix_length).cidr
+  end
+
+  def rfc_code(status)
+    {
+      valid: "Valid",
+      invalid: "Invalid",
+      not_found: "NotFound"
+    }.fetch(status)
+  end
+
+  def naive_validation(vrps, route, origin_asn)
+    route_network = IPAddr.new(route)
+    family = IPAddr.new(route.split("/", 2).first).family
+    route_address = route_network.to_i
+    route_length = route_network.prefix
+    covering = vrps.select { |prefix, _, asn|
+      network = IPAddr.new(prefix)
+      next false unless network.family == family
+
+      network_prefix = network.prefix
+      next false unless route_length >= network_prefix
+      next false unless (route_address >> (total_length(family) - network_prefix)) ==
+                        (network.to_i >> (total_length(family) - network_prefix))
+
+      true
+    }
+
+    return { status: :not_found, authorizations: [], rejections: [] } if
+      covering.empty?
+
+    authorizations = covering.select { |_, max_length, asn|
+      asn != 0 && asn == origin_asn && max_length >= route_length
+    }.map { |prefix, max_length, asn|
+      [prefix, max_length, asn]
+    }.uniq
+
+    rejections = covering.reject { |_, max_length, asn|
+      asn != 0 && asn == origin_asn && max_length >= route_length
+    }.map { |prefix, max_length, asn|
+      reason = if asn == 0
+                 :as0
+               elsif asn == origin_asn
+                 :prefix_length_exceeds_max_length
+               else
+                 :origin_asn_mismatch
+               end
+      [prefix, max_length, asn, reason]
+    }.uniq
+
+    {
+      status: authorizations.empty? ? :invalid : :valid,
+      authorizations: authorizations,
+      rejections: rejections
+    }
+  end
+
+  def total_length(family)
+    family == Socket::AF_INET ? 32 : 128
+  end
+
+end
