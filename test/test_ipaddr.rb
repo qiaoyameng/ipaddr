@@ -722,4 +722,181 @@ class TC_Operator < Test::Unit::TestCase
     end
     assert_equal('invalid address: INVALID', e.message)
   end
+
+  def test_rfc6724_rule2_scope_beats_longer_prefix
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, scope: :link),
+      IPAddr::SourceAddress.new('2002::1', prefix: 64)
+    ]
+    result = IPAddr.select_source_address(
+      '2001:db8::10', candidates, policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('2002::1', result.candidate.address.to_s)
+    assert_equal(2, result.eliminations.first.rule)
+    assert_equal(:scope_mismatch, result.eliminations.first.reason)
+  end
+
+  def test_rfc6724_deprecated_is_only_a_fallback
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, deprecated: true),
+      IPAddr::SourceAddress.new('2002::1', prefix: 64)
+    ]
+    result = IPAddr.select_source_address(
+      '2001:db8::10', candidates, policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('2002::1', result.candidate.address.to_s)
+    assert_equal(3, result.eliminations.first.rule)
+    assert_equal(:deprecated, result.eliminations.first.reason)
+
+    deprecated = IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, deprecated: true)
+    result = IPAddr.select_source_address(
+      '2001:db8::10', [deprecated], policy_table: { '::/0' => 0 }
+    )
+    assert_equal(deprecated, result.candidate)
+  end
+
+  def test_rfc6724_complete_tie_keeps_input_order_and_distinguishes_interfaces
+    address = '2001:db8::1'
+    eth0 = IPAddr::SourceAddress.new(address, interface: :eth0, prefix: 64)
+    eth1 = IPAddr::SourceAddress.new(address, interface: :eth1, prefix: 64)
+    result = IPAddr.select_source_address(
+      '2001:db8::10', [eth0, eth1], policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal(eth0, result.candidate)
+    assert_equal(:tie, result.reason)
+    assert_equal(eth1, result.eliminations.first.candidate)
+    assert_nil(result.eliminations.first.rule)
+
+    selected, reason = result
+    assert_equal(eth0, selected)
+    assert_equal(:tie, reason)
+  end
+
+  def test_rfc6724_eliminations_are_explained_against_final_winner
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, deprecated: true),
+      IPAddr::SourceAddress.new('2002::1', prefix: 64),
+      IPAddr::SourceAddress.new('2003::1', prefix: 64, temporary: true)
+    ]
+    result = IPAddr.select_source_address(
+      '2003::10', candidates, policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('2003::1', result.candidate.address.to_s)
+    reasons = result.eliminations.group_by do |elimination|
+      elimination.candidate.address.to_s
+    end.transform_values(&:first)
+    assert_equal(3, reasons['2001:db8::1'].rule)
+    assert_equal(7, reasons['2002::1'].rule)
+    assert_equal(:deprecated, reasons['2001:db8::1'].reason)
+  end
+
+  def test_rfc6724_destination_zone_is_an_availability_constraint
+    candidates = [
+      IPAddr::SourceAddress.new('fe80::1', interface: :eth1),
+      IPAddr::SourceAddress.new('fe80::1', interface: :eth0)
+    ]
+    result = IPAddr.select_source_address(
+      'fe80::10%eth0', candidates, policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('eth0', result.candidate.interface)
+    assert_equal(:destination_zone_mismatch, result.unavailable.first.reason)
+    assert_empty(result.eliminations)
+  end
+
+  def test_rfc6724_outgoing_interface_is_an_availability_constraint
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', interface: :eth1),
+      IPAddr::SourceAddress.new('2001:db8::2', interface: :eth0)
+    ]
+    result = IPAddr.select_source_address(
+      '2001:db8::10',
+      candidates,
+      policy_table: { '::/0' => 0 },
+      outgoing_interface: :eth0
+    )
+
+    assert_equal('2001:db8::2', result.candidate.address.to_s)
+    assert_equal(:outgoing_interface_mismatch, result.unavailable.first.reason)
+  end
+
+  def test_rfc6724_policy_label_is_compared_before_temporary
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, temporary: true),
+      IPAddr::SourceAddress.new('2002::1', prefix: 64)
+    ]
+    policy_table = {
+      '::/0' => 0,
+      '2002::/16' => 1
+    }
+    result = IPAddr.select_source_address(
+      '2002::10', candidates, policy_table: policy_table
+    )
+
+    assert_equal('2002::1', result.candidate.address.to_s)
+    assert_equal(6, result.eliminations.first.rule)
+    assert_equal(:label_mismatch, result.eliminations.first.reason)
+  end
+
+  def test_rfc6724_home_is_preferred_before_temporary
+    candidates = [
+      IPAddr::SourceAddress.new('2001:db8::1', prefix: 64, temporary: true),
+      IPAddr::SourceAddress.new('2002::1', prefix: 64, home: true)
+    ]
+    result = IPAddr.select_source_address(
+      '2001:db8::10', candidates, policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('2002::1', result.candidate.address.to_s)
+    assert_equal(4, result.eliminations.first.rule)
+    assert_equal(:not_home, result.eliminations.first.reason)
+  end
+
+  def test_rfc6724_longest_prefix_does_not_exceed_source_prefix
+    closer = IPAddr::SourceAddress.new('2001:db8::1', prefix: 8)
+    shorter = IPAddr::SourceAddress.new('2000::1', prefix: 128)
+    result = IPAddr.select_source_address(
+      '2001:db8::10', [closer, shorter], policy_table: { '::/0' => 0 }
+    )
+
+    assert_equal('2000::1', result.candidate.address.to_s)
+    assert_equal(8, result.eliminations.first.rule)
+    assert_equal(:longer_prefix, result.eliminations.first.reason)
+    assert_equal(15, result.eliminations.first.matched_prefix)
+  end
+
+  def test_rfc6724_accepts_explicit_candidate_hashes_and_array_policy_entries
+    result = IPAddr.select_source_address(
+      '2001:db8::10',
+      [
+        { 'address' => '2001:db8::1', 'prefix' => 64, 'interface' => 'eth0' },
+        { 'address' => '2002::1', 'prefix' => 64, 'interface' => 'eth0' }
+      ],
+      outgoing_interface: :eth0,
+      policy_table: [['::/0', 0]]
+    )
+
+    assert_equal('2001:db8::1', result.candidate.address.to_s)
+    assert_equal(8, result.eliminations.first.rule)
+  end
+
+  def test_rfc6724_rejects_unknown_route_and_missing_policy_label
+    assert_raise(IPAddr::SourceAddressSelectionError) do
+      IPAddr.select_source_address(
+        '2001:db8::10',
+        [IPAddr::SourceAddress.new('2001:db8::1')],
+        policy_table: { '2002::/16' => 0 }
+      )
+    end
+
+    assert_raise(IPAddr::SourceAddressSelectionError) do
+      IPAddr.select_source_address(
+        '2001:db8::10', [], policy_table: { '::/0' => 0 }
+      )
+    end
+  end
 end
